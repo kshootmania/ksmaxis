@@ -1,0 +1,251 @@
+﻿#ifdef _WIN32
+
+#ifndef UNICODE
+#define UNICODE
+#endif
+
+#define DIRECTINPUT_VERSION 0x0800
+#include <windows.h>
+#include <dinput.h>
+
+#include "ksmaxis/ksmaxis.hpp"
+
+#include <vector>
+
+#pragma comment(lib, "dinput8.lib")
+#pragma comment(lib, "dxguid.lib")
+
+namespace ksmaxis
+{
+	namespace
+	{
+		// Wrap-around detection threshold (half of normalized range)
+		constexpr double kWrapThreshold = 0.5;
+
+		struct Device
+		{
+			DIDEVICEINSTANCEW instance{};
+			LPDIRECTINPUTDEVICE8W device = nullptr;
+			double axisX = 0.0;
+			double axisY = 0.0;
+			double slider0 = 0.0;
+			double slider1 = 0.0;
+			double prevAxisX = 0.0;
+			double prevAxisY = 0.0;
+			double prevSlider0 = 0.0;
+			double prevSlider1 = 0.0;
+			bool opened = false;
+		};
+
+		LPDIRECTINPUT8W s_directInput = nullptr;
+		std::vector<Device> s_devices;
+		bool s_initialized = false;
+		AxisValues s_deltaAnalogStick = { 0.0, 0.0 };
+		AxisValues s_deltaSlider = { 0.0, 0.0 };
+
+		double Normalize(LONG value)
+		{
+			// -32768~32767 -> 0.0~1.0
+			return (static_cast<double>(value) + 32768.0) / 65535.0;
+		}
+
+		double CalculateDelta(double current, double prev)
+		{
+			double delta = current - prev;
+
+			// Wrap-around correction
+			if (delta > kWrapThreshold)
+			{
+				delta -= 1.0;
+			}
+			else if (delta < -kWrapThreshold)
+			{
+				delta += 1.0;
+			}
+
+			return delta;
+		}
+
+		BOOL CALLBACK EnumDevicesCallback(const DIDEVICEINSTANCEW* instance, VOID* context)
+		{
+			Device dev{};
+			dev.instance = *instance;
+			s_devices.push_back(dev);
+			return DIENUM_CONTINUE;
+		}
+	}
+
+	Error Init()
+	{
+		if (s_initialized)
+		{
+			return Error::kAlreadyInitialized;
+		}
+
+		HRESULT hr = DirectInput8Create(
+			GetModuleHandle(nullptr),
+			DIRECTINPUT_VERSION,
+			IID_IDirectInput8W,
+			reinterpret_cast<void**>(&s_directInput),
+			nullptr
+		);
+
+		if (FAILED(hr))
+		{
+			return Error::kPlatform;
+		}
+
+		s_initialized = true;
+
+		hr = s_directInput->EnumDevices(
+			DI8DEVCLASS_GAMECTRL,
+			EnumDevicesCallback,
+			nullptr,
+			DIEDFL_ATTACHEDONLY
+		);
+
+		if (FAILED(hr))
+		{
+			return Error::kPlatform;
+		}
+
+		// Open all devices
+		for (auto& dev : s_devices)
+		{
+			hr = s_directInput->CreateDevice(dev.instance.guidInstance, &dev.device, nullptr);
+			if (FAILED(hr))
+			{
+				continue;
+			}
+
+			hr = dev.device->SetDataFormat(&c_dfDIJoystick2);
+			if (FAILED(hr))
+			{
+				dev.device->Release();
+				dev.device = nullptr;
+				continue;
+			}
+
+			HWND hwnd = GetConsoleWindow();
+			if (!hwnd)
+			{
+				hwnd = GetDesktopWindow();
+			}
+
+			hr = dev.device->SetCooperativeLevel(hwnd, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
+			if (FAILED(hr))
+			{
+				dev.device->Release();
+				dev.device = nullptr;
+				continue;
+			}
+
+			DIPROPRANGE propRange{};
+			propRange.diph.dwSize = sizeof(DIPROPRANGE);
+			propRange.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+			propRange.diph.dwHow = DIPH_BYOFFSET;
+			propRange.lMin = -32768;
+			propRange.lMax = 32767;
+
+			DWORD offsets[] = { DIJOFS_X, DIJOFS_Y, DIJOFS_SLIDER(0), DIJOFS_SLIDER(1) };
+			for (DWORD offset : offsets)
+			{
+				propRange.diph.dwObj = offset;
+				dev.device->SetProperty(DIPROP_RANGE, &propRange.diph);
+			}
+
+			dev.device->Acquire();
+			dev.opened = true;
+		}
+
+		return Error::kOk;
+	}
+
+	void Terminate()
+	{
+		for (auto& dev : s_devices)
+		{
+			if (dev.device)
+			{
+				dev.device->Unacquire();
+				dev.device->Release();
+				dev.device = nullptr;
+			}
+		}
+		s_devices.clear();
+
+		if (s_directInput)
+		{
+			s_directInput->Release();
+			s_directInput = nullptr;
+		}
+
+		s_initialized = false;
+	}
+
+	void Update()
+	{
+		s_deltaAnalogStick = { 0.0, 0.0 };
+		s_deltaSlider = { 0.0, 0.0 };
+
+		if (!s_initialized)
+		{
+			return;
+		}
+
+		for (auto& dev : s_devices)
+		{
+			if (!dev.opened || !dev.device)
+			{
+				continue;
+			}
+
+			HRESULT hr = dev.device->Poll();
+			if (FAILED(hr))
+			{
+				hr = dev.device->Acquire();
+				if (FAILED(hr))
+				{
+					continue;
+				}
+				dev.device->Poll();
+			}
+
+			DIJOYSTATE2 js{};
+			hr = dev.device->GetDeviceState(sizeof(DIJOYSTATE2), &js);
+			if (FAILED(hr))
+			{
+				continue;
+			}
+
+			dev.axisX = Normalize(js.lX);
+			dev.axisY = Normalize(js.lY);
+			dev.slider0 = Normalize(js.rglSlider[0]);
+			dev.slider1 = Normalize(js.rglSlider[1]);
+
+			s_deltaAnalogStick[0] += CalculateDelta(dev.axisX, dev.prevAxisX);
+			s_deltaAnalogStick[1] += CalculateDelta(dev.axisY, dev.prevAxisY);
+			s_deltaSlider[0] += CalculateDelta(dev.slider0, dev.prevSlider0);
+			s_deltaSlider[1] += CalculateDelta(dev.slider1, dev.prevSlider1);
+
+			dev.prevAxisX = dev.axisX;
+			dev.prevAxisY = dev.axisY;
+			dev.prevSlider0 = dev.slider0;
+			dev.prevSlider1 = dev.slider1;
+		}
+	}
+
+	AxisValues GetAxisDeltas(InputMode mode)
+	{
+		if (mode == InputMode::kAnalogStick)
+		{
+			return s_deltaAnalogStick;
+		}
+		else
+		{
+			return s_deltaSlider;
+		}
+	}
+}
+
+#endif

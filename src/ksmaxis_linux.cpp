@@ -1,0 +1,307 @@
+﻿#ifdef __linux__
+
+#include <linux/input.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/ioctl.h>
+
+#include "ksmaxis/ksmaxis.hpp"
+
+#include <vector>
+#include <string>
+#include <cstring>
+#include <climits>
+#include <chrono>
+
+namespace ksmaxis
+{
+	namespace
+	{
+		constexpr std::size_t kBitsPerLong = CHAR_BIT * sizeof(unsigned long);
+
+		// Wrap-around detection threshold (half of normalized range)
+		constexpr double kWrapThreshold = 0.5;
+
+		struct AxisRange
+		{
+			std::int32_t min = 0;
+			std::int32_t max = 255;
+			bool available = false;
+		};
+
+		struct Device
+		{
+			std::string path;
+			int fd = -1;
+			double axisX = 0.0;
+			double axisY = 0.0;
+			double slider0 = 0.0;
+			double slider1 = 0.0;
+			double prevAxisX = 0.0;
+			double prevAxisY = 0.0;
+			double prevSlider0 = 0.0;
+			double prevSlider1 = 0.0;
+			AxisRange ranges[ABS_CNT]{};
+			bool opened = false;
+		};
+
+		std::vector<Device> s_devices;
+		bool s_initialized = false;
+		AxisValues s_deltaAnalogStick = { 0.0, 0.0 };
+		AxisValues s_deltaSlider = { 0.0, 0.0 };
+		std::chrono::steady_clock::time_point s_lastScanTime;
+
+		double Normalize(const Device& dev, std::int32_t code, std::int32_t value)
+		{
+			if (code < 0 || code >= ABS_CNT || !dev.ranges[code].available)
+			{
+				return 0.0;
+			}
+
+			std::int32_t min = dev.ranges[code].min;
+			std::int32_t max = dev.ranges[code].max;
+
+			if (max == min)
+			{
+				return 0.0;
+			}
+
+			// min~max -> 0.0~1.0
+			return static_cast<double>(value - min) / static_cast<double>(max - min);
+		}
+
+		double CalculateDelta(double current, double prev)
+		{
+			double delta = current - prev;
+
+			// Wrap-around correction
+			if (delta > kWrapThreshold)
+			{
+				delta -= 1.0;
+			}
+			else if (delta < -kWrapThreshold)
+			{
+				delta += 1.0;
+			}
+
+			return delta;
+		}
+
+		bool IsDeviceAlreadyOpened(const std::string& path)
+		{
+			for (const auto& dev : s_devices)
+			{
+				if (dev.path == path)
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		void RemoveDisconnectedDevices()
+		{
+			for (auto it = s_devices.begin(); it != s_devices.end();)
+			{
+				if (!it->opened || it->fd < 0)
+				{
+					++it;
+					continue;
+				}
+
+				struct input_id id;
+				if (ioctl(it->fd, EVIOCGID, &id) < 0)
+				{
+					close(it->fd);
+					it = s_devices.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+		}
+
+		void ScanDevices()
+		{
+			DIR* dir = opendir("/dev/input");
+			if (!dir)
+			{
+				return;
+			}
+
+			struct dirent* entry;
+			while ((entry = readdir(dir)) != nullptr)
+			{
+				if (strncmp(entry->d_name, "event", 5) != 0)
+				{
+					continue;
+				}
+
+				std::string path = "/dev/input/" + std::string(entry->d_name);
+
+				// Skip if already opened
+				if (IsDeviceAlreadyOpened(path))
+				{
+					continue;
+				}
+
+				int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+				if (fd < 0)
+				{
+					continue;
+				}
+
+				unsigned long evBits[(EV_CNT + kBitsPerLong - 1) / kBitsPerLong] = {};
+				if (ioctl(fd, EVIOCGBIT(0, sizeof(evBits)), evBits) < 0)
+				{
+					close(fd);
+					continue;
+				}
+
+				bool hasAbs = evBits[EV_ABS / kBitsPerLong] & (1UL << (EV_ABS % kBitsPerLong));
+				if (!hasAbs)
+				{
+					close(fd);
+					continue;
+				}
+
+				Device dev{};
+				dev.path = path;
+				dev.fd = fd;
+
+				unsigned long absBits[(ABS_CNT + kBitsPerLong - 1) / kBitsPerLong] = {};
+				if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absBits)), absBits) >= 0)
+				{
+					for (int i = 0; i < ABS_CNT; ++i)
+					{
+						if (absBits[i / kBitsPerLong] & (1UL << (i % kBitsPerLong)))
+						{
+							struct input_absinfo absInfo{};
+							if (ioctl(fd, EVIOCGABS(i), &absInfo) >= 0)
+							{
+								dev.ranges[i].min = absInfo.minimum;
+								dev.ranges[i].max = absInfo.maximum;
+								dev.ranges[i].available = true;
+							}
+						}
+					}
+				}
+
+				dev.opened = true;
+				s_devices.push_back(std::move(dev));
+			}
+
+			closedir(dir);
+		}
+	}
+
+	Error Init()
+	{
+		if (s_initialized)
+		{
+			return Error::kAlreadyInitialized;
+		}
+
+		s_initialized = true;
+		s_lastScanTime = std::chrono::steady_clock::now();
+		ScanDevices();
+
+		return Error::kOk;
+	}
+
+	void Terminate()
+	{
+		for (auto& dev : s_devices)
+		{
+			if (dev.fd >= 0)
+			{
+				close(dev.fd);
+				dev.fd = -1;
+			}
+		}
+		s_devices.clear();
+		s_initialized = false;
+	}
+
+	void Update()
+	{
+		s_deltaAnalogStick = { 0.0, 0.0 };
+		s_deltaSlider = { 0.0, 0.0 };
+
+		if (!s_initialized)
+		{
+			return;
+		}
+
+		auto now = std::chrono::steady_clock::now();
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastScanTime);
+		if (elapsed.count() >= 1000)
+		{
+			RemoveDisconnectedDevices();
+			ScanDevices();
+			s_lastScanTime = now;
+		}
+
+		for (auto& dev : s_devices)
+		{
+			if (!dev.opened || dev.fd < 0)
+			{
+				continue;
+			}
+
+			struct input_event ev{};
+			while (read(dev.fd, &ev, sizeof(ev)) == sizeof(ev))
+			{
+				if (ev.type != EV_ABS)
+				{
+					continue;
+				}
+
+				double normalized = Normalize(dev, ev.code, ev.value);
+
+				switch (ev.code)
+				{
+				case ABS_X:
+					dev.axisX = normalized;
+					break;
+				case ABS_Y:
+					dev.axisY = normalized;
+					break;
+				case ABS_THROTTLE:
+				case ABS_MISC:
+					dev.slider0 = normalized;
+					break;
+				case ABS_RUDDER:
+					dev.slider1 = normalized;
+					break;
+				}
+			}
+
+			s_deltaAnalogStick[0] += CalculateDelta(dev.axisX, dev.prevAxisX);
+			s_deltaAnalogStick[1] += CalculateDelta(dev.axisY, dev.prevAxisY);
+			s_deltaSlider[0] += CalculateDelta(dev.slider0, dev.prevSlider0);
+			s_deltaSlider[1] += CalculateDelta(dev.slider1, dev.prevSlider1);
+
+			dev.prevAxisX = dev.axisX;
+			dev.prevAxisY = dev.axisY;
+			dev.prevSlider0 = dev.slider0;
+			dev.prevSlider1 = dev.slider1;
+		}
+	}
+
+	AxisValues GetAxisDeltas(InputMode mode)
+	{
+		if (mode == InputMode::kAnalogStick)
+		{
+			return s_deltaAnalogStick;
+		}
+		else
+		{
+			return s_deltaSlider;
+		}
+	}
+}
+
+#endif
