@@ -96,8 +96,6 @@ namespace ksmaxis
 			return Error::kPlatform;
 		}
 
-		s_initialized = true;
-
 		hr = s_directInput->EnumDevices(
 			DI8DEVCLASS_GAMECTRL,
 			EnumDevicesCallback,
@@ -107,8 +105,12 @@ namespace ksmaxis
 
 		if (FAILED(hr))
 		{
+			s_directInput->Release();
+			s_directInput = nullptr;
 			return Error::kPlatform;
 		}
+
+		s_initialized = true;
 
 		// Open all devices
 		for (auto& dev : s_devices)
