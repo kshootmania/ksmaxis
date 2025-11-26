@@ -251,8 +251,8 @@ namespace ksmaxis
 
 			dev.axisX = Normalize(js.lX);
 			dev.axisY = Normalize(js.lY);
-			dev.slider0 = Normalize(js.rglSlider[0]);
-			dev.slider1 = Normalize(js.rglSlider[1]);
+			dev.slider0 = Normalize(js.rglSlider[1]); // Intentionally swapped ([0]=right knob, [1]=left knob)
+			dev.slider1 = Normalize(js.rglSlider[0]);
 
 			if (!s_firstUpdate)
 			{
