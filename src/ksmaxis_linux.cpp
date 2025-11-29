@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <X11/Xlib.h>
+#include <X11/extensions/XInput2.h>
 
 #include "ksmaxis/ksmaxis.hpp"
 
@@ -20,8 +22,6 @@ namespace ksmaxis
 	namespace
 	{
 		constexpr std::size_t kBitsPerLong = CHAR_BIT * sizeof(unsigned long);
-
-		// Wrap-around detection threshold (half of normalized range)
 		constexpr double kWrapThreshold = 0.5;
 
 		struct AxisRange
@@ -47,17 +47,17 @@ namespace ksmaxis
 			bool opened = false;
 		};
 
-		struct MouseDevice
+		struct X11MouseContext
 		{
-			std::string path;
-			int fd = -1;
+			Display* display = nullptr;
+			int xiOpcode = -1;
 			double deltaX = 0.0;
 			double deltaY = 0.0;
-			bool opened = false;
+			bool initialized = false;
 		};
 
 		std::vector<JoystickDevice> s_joystickDevices;
-		std::vector<MouseDevice> s_mouseDevices;
+		X11MouseContext s_x11Mouse;
 		bool s_initialized = false;
 		bool s_firstUpdate = true;
 		AxisValues s_deltaAnalogStick = { 0.0, 0.0 };
@@ -113,18 +113,6 @@ namespace ksmaxis
 			return false;
 		}
 
-		bool IsMouseDeviceAlreadyOpened(const std::string& path)
-		{
-			for (const auto& dev : s_mouseDevices)
-			{
-				if (dev.path == path)
-				{
-					return true;
-				}
-			}
-			return false;
-		}
-
 		void RemoveDisconnectedJoystickDevices()
 		{
 			for (auto it = s_joystickDevices.begin(); it != s_joystickDevices.end();)
@@ -140,29 +128,6 @@ namespace ksmaxis
 				{
 					close(it->fd);
 					it = s_joystickDevices.erase(it);
-				}
-				else
-				{
-					++it;
-				}
-			}
-		}
-
-		void RemoveDisconnectedMouseDevices()
-		{
-			for (auto it = s_mouseDevices.begin(); it != s_mouseDevices.end();)
-			{
-				if (!it->opened || it->fd < 0)
-				{
-					++it;
-					continue;
-				}
-
-				struct input_id id;
-				if (ioctl(it->fd, EVIOCGID, &id) < 0)
-				{
-					close(it->fd);
-					it = s_mouseDevices.erase(it);
 				}
 				else
 				{
@@ -244,87 +209,69 @@ namespace ksmaxis
 			closedir(dir);
 		}
 
-		void ScanMouseDevices(std::vector<std::string>* pWarningStrings = nullptr)
+		bool InitX11Mouse(std::vector<std::string>* pWarningStrings)
 		{
-			DIR* dir = opendir("/dev/input");
-			if (!dir)
+			s_x11Mouse.display = XOpenDisplay(nullptr);
+			if (!s_x11Mouse.display)
 			{
-				return;
+				if (pWarningStrings)
+				{
+					pWarningStrings->push_back("Failed to open X11 display");
+				}
+				return false;
 			}
 
-			bool permissionErrorReported = false;
-			struct dirent* entry;
-			while ((entry = readdir(dir)) != nullptr)
+			int xiEvent, xiError;
+			if (!XQueryExtension(s_x11Mouse.display, "XInputExtension", &s_x11Mouse.xiOpcode, &xiEvent, &xiError))
 			{
-				if (strncmp(entry->d_name, "event", 5) != 0)
+				if (pWarningStrings)
 				{
-					continue;
+					pWarningStrings->push_back("XInput extension not available");
 				}
-
-				std::string path = "/dev/input/" + std::string{ entry->d_name };
-
-				// Skip if already opened as joystick
-				if (IsJoystickDeviceAlreadyOpened(path))
-				{
-					continue;
-				}
-
-				// Skip if already opened as mouse
-				if (IsMouseDeviceAlreadyOpened(path))
-				{
-					continue;
-				}
-
-				int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
-				if (fd < 0)
-				{
-					if (errno == EACCES && !permissionErrorReported && pWarningStrings)
-					{
-						pWarningStrings->push_back("Permission denied: " + path + " (add user to 'input' group)");
-						permissionErrorReported = true;
-					}
-					continue;
-				}
-
-				unsigned long evBits[(EV_CNT + kBitsPerLong - 1) / kBitsPerLong] = {};
-				if (ioctl(fd, EVIOCGBIT(0, sizeof(evBits)), evBits) < 0)
-				{
-					close(fd);
-					continue;
-				}
-
-				// Check for relative events (mice report EV_REL)
-				bool hasRel = evBits[EV_REL / kBitsPerLong] & (1UL << (EV_REL % kBitsPerLong));
-				if (!hasRel)
-				{
-					close(fd);
-					continue;
-				}
-
-				// Check for REL_X and REL_Y (mouse movement axes)
-				unsigned long relBits[(REL_CNT + kBitsPerLong - 1) / kBitsPerLong] = {};
-				if (ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relBits)), relBits) < 0)
-				{
-					close(fd);
-					continue;
-				}
-
-				bool hasRelX = relBits[REL_X / kBitsPerLong] & (1UL << (REL_X % kBitsPerLong));
-				bool hasRelY = relBits[REL_Y / kBitsPerLong] & (1UL << (REL_Y % kBitsPerLong));
-				if (!hasRelX || !hasRelY)
-				{
-					close(fd);
-					continue;
-				}
-
-				MouseDevice dev{};
-				dev.path = path;
-				dev.fd = fd;
-				dev.opened = true;
-				s_mouseDevices.push_back(std::move(dev));
+				XCloseDisplay(s_x11Mouse.display);
+				s_x11Mouse.display = nullptr;
+				return false;
 			}
 
-			closedir(dir);
+			int major = 2, minor = 2;
+			if (XIQueryVersion(s_x11Mouse.display, &major, &minor) != Success)
+			{
+				if (pWarningStrings)
+				{
+					pWarningStrings->push_back("XInput2 version 2.2 not available");
+				}
+				XCloseDisplay(s_x11Mouse.display);
+				s_x11Mouse.display = nullptr;
+				return false;
+			}
+
+			XIEventMask eventMask;
+			unsigned char maskData[XIMaskLen(XI_RawMotion)] = {};
+			XISetMask(maskData, XI_RawMotion);
+
+			eventMask.deviceid = XIAllMasterDevices;
+			eventMask.mask_len = sizeof(maskData);
+			eventMask.mask = maskData;
+
+			Window root = DefaultRootWindow(s_x11Mouse.display);
+			XISelectEvents(s_x11Mouse.display, root, &eventMask, 1);
+			XFlush(s_x11Mouse.display);
+
+			s_x11Mouse.initialized = true;
+			return true;
+		}
+
+		void TerminateX11Mouse()
+		{
+			if (s_x11Mouse.display)
+			{
+				XCloseDisplay(s_x11Mouse.display);
+				s_x11Mouse.display = nullptr;
+			}
+			s_x11Mouse.initialized = false;
+			s_x11Mouse.xiOpcode = -1;
+			s_x11Mouse.deltaX = 0.0;
+			s_x11Mouse.deltaY = 0.0;
 		}
 	}
 
@@ -343,7 +290,7 @@ namespace ksmaxis
 		s_firstUpdate = true;
 		s_lastScanTime = std::chrono::steady_clock::now();
 		ScanJoystickDevices();
-		ScanMouseDevices(pWarningStrings);
+		InitX11Mouse(pWarningStrings);
 
 		return true;
 	}
@@ -360,15 +307,7 @@ namespace ksmaxis
 		}
 		s_joystickDevices.clear();
 
-		for (auto& dev : s_mouseDevices)
-		{
-			if (dev.fd >= 0)
-			{
-				close(dev.fd);
-				dev.fd = -1;
-			}
-		}
-		s_mouseDevices.clear();
+		TerminateX11Mouse();
 
 		s_initialized = false;
 	}
@@ -389,9 +328,7 @@ namespace ksmaxis
 		if (elapsed.count() >= 1000)
 		{
 			RemoveDisconnectedJoystickDevices();
-			RemoveDisconnectedMouseDevices();
 			ScanJoystickDevices();
-			ScanMouseDevices();
 			s_lastScanTime = now;
 		}
 
@@ -444,39 +381,40 @@ namespace ksmaxis
 			dev.prevSlider1 = dev.slider1;
 		}
 
-		// Process mouse devices
-		for (auto& dev : s_mouseDevices)
+		if (s_x11Mouse.initialized && s_x11Mouse.display)
 		{
-			if (!dev.opened || dev.fd < 0)
+			s_x11Mouse.deltaX = 0.0;
+			s_x11Mouse.deltaY = 0.0;
+
+			while (XPending(s_x11Mouse.display) > 0)
 			{
-				continue;
+				XEvent event;
+				XNextEvent(s_x11Mouse.display, &event);
+
+				XGenericEventCookie* cookie = &event.xcookie;
+				if (cookie->type == GenericEvent && cookie->extension == s_x11Mouse.xiOpcode && XGetEventData(s_x11Mouse.display, cookie))
+				{
+					if (cookie->evtype == XI_RawMotion)
+					{
+						XIRawEvent* rawEvent = reinterpret_cast<XIRawEvent*>(cookie->data);
+						double* rawValues = rawEvent->raw_values;
+
+						if (XIMaskIsSet(rawEvent->valuators.mask, 0))
+						{
+							s_x11Mouse.deltaX += *rawValues;
+							rawValues++;
+						}
+						if (XIMaskIsSet(rawEvent->valuators.mask, 1))
+						{
+							s_x11Mouse.deltaY += *rawValues;
+						}
+					}
+					XFreeEventData(s_x11Mouse.display, cookie);
+				}
 			}
 
-			struct input_event ev{};
-			while (read(dev.fd, &ev, sizeof(ev)) == sizeof(ev))
-			{
-				if (ev.type != EV_REL)
-				{
-					continue;
-				}
-
-				if (ev.code == REL_X)
-				{
-					dev.deltaX += static_cast<double>(ev.value);
-				}
-				else if (ev.code == REL_Y)
-				{
-					dev.deltaY += static_cast<double>(ev.value);
-				}
-			}
-
-			// Accumulate mouse deltas from all devices
-			s_deltaMouse[0] += dev.deltaX;
-			s_deltaMouse[1] += dev.deltaY;
-
-			// Reset device accumulators
-			dev.deltaX = 0.0;
-			dev.deltaY = 0.0;
+			s_deltaMouse[0] = s_x11Mouse.deltaX;
+			s_deltaMouse[1] = s_x11Mouse.deltaY;
 		}
 
 		s_firstUpdate = false;
