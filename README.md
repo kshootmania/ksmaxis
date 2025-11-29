@@ -4,11 +4,12 @@ A library for reading knob axis values using native OS APIs, designed for [ksm-v
 
 ## Dependencies
 
-| Platform | Library |
-|----------|---------|
-| Windows  | DirectInput 8 |
-| Linux    | evdev |
-| macOS    | IOKit HID |
+| Platform | Input Type                           | Backend |
+|----------|--------------------------------------|---------|
+| Windows  | `kAnalogStick` / `kSlider` / `kMouse` | DirectInput 8 |
+| macOS    | `kAnalogStick` / `kSlider` / `kMouse` | IOKit HID |
+| Linux    | `kAnalogStick` / `kSlider`           | evdev |
+| Linux    | `kMouse`                             | X11 XInput2 |
 
 ## Supported Input Modes
 

@@ -1,5 +1,7 @@
 ﻿#ifdef __linux__
 
+#include "ksmaxis/ksmaxis.hpp"
+
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -7,8 +9,6 @@
 #include <sys/ioctl.h>
 #include <X11/Xlib.h>
 #include <X11/extensions/XInput2.h>
-
-#include "ksmaxis/ksmaxis.hpp"
 
 #include <vector>
 #include <string>
@@ -233,7 +233,8 @@ namespace ksmaxis
 				return false;
 			}
 
-			int major = 2, minor = 2;
+			int major = 2;
+			int minor = 2;
 			if (XIQueryVersion(s_x11Mouse.display, &major, &minor) != Success)
 			{
 				if (pWarningStrings)
