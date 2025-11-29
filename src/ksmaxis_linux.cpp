@@ -1,26 +1,27 @@
 ﻿#ifdef __linux__
 
+#include "ksmaxis/ksmaxis.hpp"
+
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
-
-#include "ksmaxis/ksmaxis.hpp"
+#include <X11/Xlib.h>
+#include <X11/extensions/XInput2.h>
 
 #include <vector>
 #include <string>
 #include <cstring>
 #include <climits>
 #include <chrono>
+#include <cerrno>
 
 namespace ksmaxis
 {
 	namespace
 	{
 		constexpr std::size_t kBitsPerLong = CHAR_BIT * sizeof(unsigned long);
-
-		// Wrap-around detection threshold (half of normalized range)
 		constexpr double kWrapThreshold = 0.5;
 
 		struct AxisRange
@@ -30,7 +31,7 @@ namespace ksmaxis
 			bool available = false;
 		};
 
-		struct Device
+		struct JoystickDevice
 		{
 			std::string path;
 			int fd = -1;
@@ -46,14 +47,25 @@ namespace ksmaxis
 			bool opened = false;
 		};
 
-		std::vector<Device> s_devices;
+		struct X11MouseContext
+		{
+			Display* display = nullptr;
+			int xiOpcode = -1;
+			double deltaX = 0.0;
+			double deltaY = 0.0;
+			bool initialized = false;
+		};
+
+		std::vector<JoystickDevice> s_joystickDevices;
+		X11MouseContext s_x11Mouse;
 		bool s_initialized = false;
 		bool s_firstUpdate = true;
 		AxisValues s_deltaAnalogStick = { 0.0, 0.0 };
 		AxisValues s_deltaSlider = { 0.0, 0.0 };
+		AxisValues s_deltaMouse = { 0.0, 0.0 };
 		std::chrono::steady_clock::time_point s_lastScanTime;
 
-		double Normalize(const Device& dev, std::int32_t code, std::int32_t value)
+		double Normalize(const JoystickDevice& dev, std::int32_t code, std::int32_t value)
 		{
 			if (code < 0 || code >= ABS_CNT || !dev.ranges[code].available)
 			{
@@ -89,9 +101,9 @@ namespace ksmaxis
 			return delta;
 		}
 
-		bool IsDeviceAlreadyOpened(const std::string& path)
+		bool IsJoystickDeviceAlreadyOpened(const std::string& path)
 		{
-			for (const auto& dev : s_devices)
+			for (const auto& dev : s_joystickDevices)
 			{
 				if (dev.path == path)
 				{
@@ -101,9 +113,9 @@ namespace ksmaxis
 			return false;
 		}
 
-		void RemoveDisconnectedDevices()
+		void RemoveDisconnectedJoystickDevices()
 		{
-			for (auto it = s_devices.begin(); it != s_devices.end();)
+			for (auto it = s_joystickDevices.begin(); it != s_joystickDevices.end();)
 			{
 				if (!it->opened || it->fd < 0)
 				{
@@ -115,7 +127,7 @@ namespace ksmaxis
 				if (ioctl(it->fd, EVIOCGID, &id) < 0)
 				{
 					close(it->fd);
-					it = s_devices.erase(it);
+					it = s_joystickDevices.erase(it);
 				}
 				else
 				{
@@ -124,7 +136,7 @@ namespace ksmaxis
 			}
 		}
 
-		void ScanDevices()
+		void ScanJoystickDevices()
 		{
 			DIR* dir = opendir("/dev/input");
 			if (!dir)
@@ -140,10 +152,10 @@ namespace ksmaxis
 					continue;
 				}
 
-				std::string path = "/dev/input/" + std::string(entry->d_name);
+				std::string path = "/dev/input/" + std::string{ entry->d_name };
 
 				// Skip if already opened
-				if (IsDeviceAlreadyOpened(path))
+				if (IsJoystickDeviceAlreadyOpened(path))
 				{
 					continue;
 				}
@@ -168,7 +180,7 @@ namespace ksmaxis
 					continue;
 				}
 
-				Device dev{};
+				JoystickDevice dev{};
 				dev.path = path;
 				dev.fd = fd;
 
@@ -191,14 +203,80 @@ namespace ksmaxis
 				}
 
 				dev.opened = true;
-				s_devices.push_back(std::move(dev));
+				s_joystickDevices.push_back(std::move(dev));
 			}
 
 			closedir(dir);
 		}
+
+		bool InitX11Mouse(std::vector<std::string>* pWarningStrings)
+		{
+			s_x11Mouse.display = XOpenDisplay(nullptr);
+			if (!s_x11Mouse.display)
+			{
+				if (pWarningStrings)
+				{
+					pWarningStrings->push_back("Failed to open X11 display");
+				}
+				return false;
+			}
+
+			int xiEvent, xiError;
+			if (!XQueryExtension(s_x11Mouse.display, "XInputExtension", &s_x11Mouse.xiOpcode, &xiEvent, &xiError))
+			{
+				if (pWarningStrings)
+				{
+					pWarningStrings->push_back("XInput extension not available");
+				}
+				XCloseDisplay(s_x11Mouse.display);
+				s_x11Mouse.display = nullptr;
+				return false;
+			}
+
+			int major = 2;
+			int minor = 2;
+			if (XIQueryVersion(s_x11Mouse.display, &major, &minor) != Success)
+			{
+				if (pWarningStrings)
+				{
+					pWarningStrings->push_back("XInput2 version 2.2 not available");
+				}
+				XCloseDisplay(s_x11Mouse.display);
+				s_x11Mouse.display = nullptr;
+				return false;
+			}
+
+			XIEventMask eventMask;
+			unsigned char maskData[XIMaskLen(XI_RawMotion)] = {};
+			XISetMask(maskData, XI_RawMotion);
+
+			eventMask.deviceid = XIAllMasterDevices;
+			eventMask.mask_len = sizeof(maskData);
+			eventMask.mask = maskData;
+
+			Window root = DefaultRootWindow(s_x11Mouse.display);
+			XISelectEvents(s_x11Mouse.display, root, &eventMask, 1);
+			XFlush(s_x11Mouse.display);
+
+			s_x11Mouse.initialized = true;
+			return true;
+		}
+
+		void TerminateX11Mouse()
+		{
+			if (s_x11Mouse.display)
+			{
+				XCloseDisplay(s_x11Mouse.display);
+				s_x11Mouse.display = nullptr;
+			}
+			s_x11Mouse.initialized = false;
+			s_x11Mouse.xiOpcode = -1;
+			s_x11Mouse.deltaX = 0.0;
+			s_x11Mouse.deltaY = 0.0;
+		}
 	}
 
-	bool Init(std::string* pErrorString)
+	bool Init(std::string* pErrorString, std::vector<std::string>* pWarningStrings)
 	{
 		if (s_initialized)
 		{
@@ -212,14 +290,15 @@ namespace ksmaxis
 		s_initialized = true;
 		s_firstUpdate = true;
 		s_lastScanTime = std::chrono::steady_clock::now();
-		ScanDevices();
+		ScanJoystickDevices();
+		InitX11Mouse(pWarningStrings);
 
 		return true;
 	}
 
 	void Terminate()
 	{
-		for (auto& dev : s_devices)
+		for (auto& dev : s_joystickDevices)
 		{
 			if (dev.fd >= 0)
 			{
@@ -227,7 +306,10 @@ namespace ksmaxis
 				dev.fd = -1;
 			}
 		}
-		s_devices.clear();
+		s_joystickDevices.clear();
+
+		TerminateX11Mouse();
+
 		s_initialized = false;
 	}
 
@@ -235,6 +317,7 @@ namespace ksmaxis
 	{
 		s_deltaAnalogStick = { 0.0, 0.0 };
 		s_deltaSlider = { 0.0, 0.0 };
+		s_deltaMouse = { 0.0, 0.0 };
 
 		if (!s_initialized)
 		{
@@ -245,12 +328,12 @@ namespace ksmaxis
 		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastScanTime);
 		if (elapsed.count() >= 1000)
 		{
-			RemoveDisconnectedDevices();
-			ScanDevices();
+			RemoveDisconnectedJoystickDevices();
+			ScanJoystickDevices();
 			s_lastScanTime = now;
 		}
 
-		for (auto& dev : s_devices)
+		for (auto& dev : s_joystickDevices)
 		{
 			if (!dev.opened || dev.fd < 0)
 			{
@@ -299,6 +382,42 @@ namespace ksmaxis
 			dev.prevSlider1 = dev.slider1;
 		}
 
+		if (s_x11Mouse.initialized && s_x11Mouse.display)
+		{
+			s_x11Mouse.deltaX = 0.0;
+			s_x11Mouse.deltaY = 0.0;
+
+			while (XPending(s_x11Mouse.display) > 0)
+			{
+				XEvent event;
+				XNextEvent(s_x11Mouse.display, &event);
+
+				XGenericEventCookie* cookie = &event.xcookie;
+				if (cookie->type == GenericEvent && cookie->extension == s_x11Mouse.xiOpcode && XGetEventData(s_x11Mouse.display, cookie))
+				{
+					if (cookie->evtype == XI_RawMotion)
+					{
+						XIRawEvent* rawEvent = reinterpret_cast<XIRawEvent*>(cookie->data);
+						double* rawValues = rawEvent->raw_values;
+
+						if (XIMaskIsSet(rawEvent->valuators.mask, 0))
+						{
+							s_x11Mouse.deltaX += *rawValues;
+							rawValues++;
+						}
+						if (XIMaskIsSet(rawEvent->valuators.mask, 1))
+						{
+							s_x11Mouse.deltaY += *rawValues;
+						}
+					}
+					XFreeEventData(s_x11Mouse.display, cookie);
+				}
+			}
+
+			s_deltaMouse[0] = s_x11Mouse.deltaX;
+			s_deltaMouse[1] = s_x11Mouse.deltaY;
+		}
+
 		s_firstUpdate = false;
 	}
 
@@ -307,6 +426,10 @@ namespace ksmaxis
 		if (mode == InputMode::kAnalogStick)
 		{
 			return s_deltaAnalogStick;
+		}
+		else if (mode == InputMode::kMouse)
+		{
+			return s_deltaMouse;
 		}
 		else
 		{

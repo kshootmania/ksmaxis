@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <array>
 #include <string>
+#include <vector>
 
 namespace ksmaxis
 {
@@ -9,11 +10,16 @@ namespace ksmaxis
 	{
 		kAnalogStick, // X/Y
 		kSlider, // Slider0/Slider1
+		kMouse, // Mouse X/Y
 	};
 
 	using AxisValues = std::array<double, 2>;
 
-	bool Init(std::string* pErrorString = nullptr);
+#ifdef _WIN32
+	bool Init(void* hWnd, std::string* pErrorString = nullptr, std::vector<std::string>* pWarningStrings = nullptr);
+#else
+	bool Init(std::string* pErrorString = nullptr, std::vector<std::string>* pWarningStrings = nullptr);
+#endif
 
 	void Terminate();
 
