@@ -333,12 +333,12 @@ namespace ksmaxis
 		return true;
 	}
 
-	bool IsInitialized()
+	bool IsInitialized() noexcept
 	{
 		return s_initializedDevices != DeviceFlags::None;
 	}
 
-	bool IsInitialized(DeviceFlags deviceFlags)
+	bool IsInitialized(DeviceFlags deviceFlags) noexcept
 	{
 		return (s_initializedDevices & deviceFlags) == deviceFlags;
 	}
@@ -437,7 +437,7 @@ namespace ksmaxis
 		s_firstUpdate = false;
 	}
 
-	AxisValues GetAxisDeltas(InputMode mode)
+	AxisValues GetAxisDeltas(InputMode mode) noexcept
 	{
 		if (mode == InputMode::kAnalogStick)
 		{

@@ -57,15 +57,15 @@ namespace ksmaxis
 	void Terminate();
 
 	[[nodiscard]]
-	bool IsInitialized();
+	bool IsInitialized() noexcept;
 
 	[[nodiscard]]
-	bool IsInitialized(DeviceFlags deviceFlags);
+	bool IsInitialized(DeviceFlags deviceFlags) noexcept;
 
 	void Update();
 
 	[[nodiscard]]
-	AxisValues GetAxisDeltas(InputMode mode);
+	AxisValues GetAxisDeltas(InputMode mode) noexcept;
 
 	[[nodiscard]]
 	constexpr DeviceFlags GetRequiredDeviceFlags(InputMode mode) noexcept

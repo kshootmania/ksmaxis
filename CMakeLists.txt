@@ -34,8 +34,13 @@ endif()
 target_compile_features(ksmaxis PUBLIC cxx_std_20)
 
 option(KSMAXIS_BUILD_EXAMPLE "Build example application" ON)
+option(KSMAXIS_BUILD_MODULES "Build modules" ON)
 
 if(KSMAXIS_BUILD_EXAMPLE)
 	add_executable(ksmaxis_example example/main.cpp)
 	target_link_libraries(ksmaxis_example PRIVATE ksmaxis)
+endif()
+
+if(KSMAXIS_BUILD_MODULES)
+	add_subdirectory(modules)
 endif()
