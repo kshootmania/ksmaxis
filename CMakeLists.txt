@@ -17,7 +17,9 @@ target_include_directories(ksmaxis PUBLIC
 	${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-if(WIN32)
+if(EMSCRIPTEN)
+	# Web版はemscriptenのHTML5 APIを使用するため追加のリンクは不要
+elseif(WIN32)
 	target_link_libraries(ksmaxis PRIVATE dinput8 dxguid)
 elseif(APPLE)
 	find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
